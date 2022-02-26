@@ -90,9 +90,16 @@ hot_update(MaxProcess) ->
     HrlChangeList = get_all_change_hrl(Map, ChangeSet),
     statistics(wall_clock),
     {NeedCompileFiles, DetsUpdateValues} = filter_for_hot_update(Files, HrlChangeList),
+    {Behaviors, RestFiles} = filter_behaviors(NeedCompileFiles, [], []),
     {_, Time1} = statistics(wall_clock),
     io:format("filter files use: ~w seconds ~n", [Time1 / 1000]),
-    DivideFiles = divide_list(NeedCompileFiles, ?PROCESS_TASK_NUM),
+
+    length(Behaviors) > 0 andalso
+        begin
+            IsBehaviorsSuccess = compile_files(Behaviors),
+            IsBehaviorsSuccess =:= error andalso erlang:throw({error, "compile bahavior fail"})
+        end,
+    DivideFiles = divide_list(RestFiles, ?PROCESS_TASK_NUM),
     %% length(HrlChangeList) > 0 andalso io:format("change hrl files ~p ~n", [HrlChangeList]),
     %% io:format("need compile files ~p ~n", [NeedCompileFiles]),
     IDList = init_worker(MaxProcess, self(), []),
@@ -120,7 +127,7 @@ compile_all(MaxProcess) ->
     {Behaviors, RestFiles} = filter_behaviors(FileList, [], []),
     statistics(wall_clock),
     IsBehaviorsSuccess = compile_files(Behaviors),
-    IsBehaviorsSuccess =:= error andalso erlang:throw("fail"),
+    IsBehaviorsSuccess =:= error andalso erlang:throw({error, "compile bahavior fail"}),
     DiviedFles = divide_list(RestFiles, ?PROCESS_TASK_NUM),
     io:format("compiled behaviors: ~p~n", [Behaviors]),
     IDList = init_worker(MaxProcess, self(), []),
