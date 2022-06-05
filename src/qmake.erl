@@ -86,7 +86,8 @@ compile(MaxProcess) ->
 hot_update(MaxProcess) ->
     Files = get_src_files(),
     HrlFiles = get_include_files(),
-    {Map, ChangeSet} = make_hrl_map(HrlFiles, #{}, sets:new()),
+    RelativePaths = get_include_relative_paths(),
+    {Map, ChangeSet} = make_hrl_map(HrlFiles, #{}, sets:new(), RelativePaths),
     HrlChangeList = get_all_change_hrl(Map, ChangeSet),
     statistics(wall_clock),
     {NeedCompileFiles, DetsUpdateValues} = filter_for_hot_update(Files, HrlChangeList),
@@ -250,13 +251,15 @@ get_files_curr_ver([H | T], Acc) ->
 
 
 %% @doc 文件包含头文件是否改变
--spec is_hrl_changed(Bin, ChangeHrlList) -> true | false when
+-spec is_hrl_changed(Bin, ChangeHrlList, RelativePaths) -> true | false when
     Bin :: iodata(),
-    ChangeHrlList :: [string()].
-is_hrl_changed(Bin, ChangeHrlList) ->
+    ChangeHrlList :: [string()],
+    RelativePaths :: [string()].
+
+is_hrl_changed(Bin, ChangeHrlList, RelativePaths) ->
     case re:run(Bin, ?MP(?PATTERN_HRL), [global, {capture, all, list}]) of
         {match, List} ->
-            HrlList = format_hrl_list(List, []),
+            HrlList = format_hrl_list(List, [], RelativePaths),
             is_hrl_changed_1(HrlList, ChangeHrlList);
         _ ->
             false
@@ -267,21 +270,35 @@ is_hrl_changed_1([], _) ->
 is_hrl_changed_1([H | T], ChangeHrlList) ->
     ?iif(lists:member(H, ChangeHrlList), true, is_hrl_changed_1(T, ChangeHrlList)).
 
+get_include_relative_paths() ->
+    Fun = fun
+              ({'i', Path}, Acc) ->
+                  RelativePath = "./" ++ Path ++ "/",
+                  [RelativePath | Acc];
+              (_, Acc) -> Acc
+          end,
+    lists:foldl(Fun, [], ?EMAKEFILE_ARGS).
+
 %% @doc 拼装hrl文件路径
-format_hrl_list([], Acc) ->
+format_hrl_list([], Acc, _) ->
     Acc;
-format_hrl_list([[_, Need] | T], Acc) ->
-    format_hrl_list(T, ["./include/" ++ Need | Acc]).
+format_hrl_list([[_, Need] | T], Acc, RelativePaths) ->
+    NAcc = [RP ++ Need || RP <- RelativePaths] ++ Acc,
+    format_hrl_list(T, NAcc, RelativePaths).
 
 %% @doc 获取包含头文件列表
--spec get_include_hrl_files(Bin) -> HrlList when
+-spec get_include_hrl_files(Bin, RelativePaths) -> HrlList when
     Bin :: iodata(),
-    HrlList :: [] | [string()].
-get_include_hrl_files(Bin) ->
+    HrlList :: [] | [string()],
+    RelativePaths :: [string()].
+
+get_include_hrl_files(Bin, RelativePaths) ->
     case re:run(Bin, ?MP(?PATTERN_HRL), [global, {capture, all, list}]) of
-        {match, List} -> lists:reverse(format_hrl_list(List, []));
+        {match, List} ->
+            lists:reverse(format_hrl_list(List, [], RelativePaths));
         _ -> []
     end.
+
 
 %% @doc 返回列表，erl包含这个列表的任意头文件则需要重新编译
 -spec get_all_change_hrl(CitiedMap, FileChangeSet) -> ChangeList when
@@ -313,24 +330,25 @@ get_all_change_hrl_1(CitiedMap, ChangeSet, AccSet) ->
     end.
 
 %% @doc 制作引用库
--spec make_hrl_map(HrlFileList, Map, FileChangeSet) -> {CitiedMap, FileChangeSet} when
+-spec make_hrl_map(HrlFileList, Map, FileChangeSet, RelativePaths) -> {CitiedMap, FileChangeSet} when
     HrlFileList :: [string()],
     Map :: map(),
     CitiedMap :: map(),
-    FileChangeSet::set().
+    FileChangeSet::set(),
+    RelativePaths :: [string()].
 
-make_hrl_map([], CitiedMap, FileChangeSet) ->
+make_hrl_map([], CitiedMap, FileChangeSet, _) ->
     {CitiedMap, FileChangeSet};
-make_hrl_map([H | T], CitiedMap, FileChangeSet) ->
+make_hrl_map([H | T], CitiedMap, FileChangeSet, RelativePaths) ->
     {ok, Bin} = file:read_file(H),
     CurrVer = ?MD5(Bin),
-    L = get_include_hrl_files(Bin),
+    L = get_include_hrl_files(Bin, RelativePaths),
     NMap = add_to_citied_set(L, H, CitiedMap),
     NFileChangeSet = case dets:lookup(?TABLE, H) of
                          [{H, V}] when V =:= CurrVer -> FileChangeSet;
                          _ -> sets:add_element(H, FileChangeSet)
                      end,
-    make_hrl_map(T, NMap, NFileChangeSet).
+    make_hrl_map(T, NMap, NFileChangeSet, RelativePaths).
 
 add_to_citied_set([], _, CitiedMap) ->
     CitiedMap;
@@ -375,36 +393,35 @@ get_include_files_(Path) ->
 filter_for_hot_update(List, ChangeHrlList) when is_list(List) ->
     EMakeArgs = ?EMAKEFILE_ARGS,
     {_, OutDir} = lists:keyfind(outdir, 1, EMakeArgs),
-    filter_for_hot_update_1(List, ChangeHrlList, [], [], OutDir).
+    RelativePaths = get_include_relative_paths(),
+    filter_for_hot_update_1(List, ChangeHrlList, [], [], OutDir, RelativePaths).
 
-filter_for_hot_update_1([], _, NeedCompileFiles, DetsUpdateErlFiles, _OutDir) ->
+filter_for_hot_update_1([], _, NeedCompileFiles, DetsUpdateErlFiles, _OutDir, _RelativePaths) ->
     {NeedCompileFiles, DetsUpdateErlFiles};
-filter_for_hot_update_1([H | T], ChangeHrlList, NeedCompileFiles, DetsUpdateErlFiles, OutDir) ->
+filter_for_hot_update_1([H | T], ChangeHrlList, NeedCompileFiles, DetsUpdateErlFiles, OutDir, RelativePaths) ->
     {ok, Bin} = file:read_file(H),
     NowVer = ?MD5(Bin),
     case dets:lookup(?TABLE, H) of
         [] -> %新文件
-            filter_for_hot_update_1(T, ChangeHrlList, [H | NeedCompileFiles], [{H, NowVer} | DetsUpdateErlFiles], OutDir);
+            filter_for_hot_update_1(T, ChangeHrlList, [H | NeedCompileFiles], [{H, NowVer} | DetsUpdateErlFiles], OutDir, RelativePaths);
         [{H, V}] ->
             if
                 NowVer =/= V -> %已修改文件
-                    filter_for_hot_update_1(T, ChangeHrlList, [H | NeedCompileFiles], [{H, NowVer} | DetsUpdateErlFiles], OutDir);
+                    filter_for_hot_update_1(T, ChangeHrlList, [H | NeedCompileFiles], [{H, NowVer} | DetsUpdateErlFiles], OutDir, RelativePaths);
                 H =/= ?MODULE_PATH -> %检查头文件,过滤自己是因为正则会导致额外的匹配
                     BaseName = filename:basename(H, ".erl"),
                     BeamPath = filename:join([OutDir, BaseName]) ++ ".beam",
                     case filelib:is_file(BeamPath) of
                         false ->
-                            filter_for_hot_update_1(T, ChangeHrlList, [H | NeedCompileFiles], [{H, NowVer} | DetsUpdateErlFiles], OutDir);
+                            filter_for_hot_update_1(T, ChangeHrlList, [H | NeedCompileFiles], [{H, NowVer} | DetsUpdateErlFiles], OutDir, RelativePaths);
                         _ ->
-                            case is_hrl_changed(Bin, ChangeHrlList) of
-                                false ->
-                                    filter_for_hot_update_1(T, ChangeHrlList, NeedCompileFiles, DetsUpdateErlFiles, OutDir);
-                                true ->
-                                    filter_for_hot_update_1(T, ChangeHrlList, [H | NeedCompileFiles], DetsUpdateErlFiles, OutDir)
+                            case is_hrl_changed(Bin, ChangeHrlList, RelativePaths) of
+                                false -> filter_for_hot_update_1(T, ChangeHrlList, NeedCompileFiles, DetsUpdateErlFiles, OutDir, RelativePaths);
+                                true -> filter_for_hot_update_1(T, ChangeHrlList, [H | NeedCompileFiles], DetsUpdateErlFiles, OutDir, RelativePaths)
                             end
                     end;
                 true ->
-                    filter_for_hot_update_1(T, ChangeHrlList, NeedCompileFiles, DetsUpdateErlFiles, OutDir)
+                    filter_for_hot_update_1(T, ChangeHrlList, NeedCompileFiles, DetsUpdateErlFiles, OutDir, RelativePaths)
             end
     end.
 
