@@ -44,6 +44,12 @@
 -define(OUTPUT_DIR, "ebin").
 -define(EMAKEFILE_ARGS, begin {ok, [{_, ArgsList}]} = file:consult("./Emakefile"), ArgsList end).
 
+%% @doc 如果 transform 有互相引用的情况，临时的解决方式是在这里定义顺序， 或者后续改成读取配置文件， 反正都是要给他们定一个编译顺序。。。
+%%  目前我也只遇到过一次这种情况
+-define(TRANS_SEQ_FILES, [
+
+]).
+
 -type set() :: tuple().
 
 %% @doc 编译方法
@@ -91,18 +97,21 @@ hot_update(MaxProcess) ->
     HrlChangeList = get_all_change_hrl(Map, ChangeSet),
     statistics(wall_clock),
     {NeedCompileFiles, DetsUpdateValues} = filter_for_hot_update(Files, HrlChangeList),
-    {Behaviors, RestFiles} = filter_behaviors(NeedCompileFiles, [], []),
+    {Trans, Behaviors, RestFiles} = filter_behaviors(NeedCompileFiles, [], [], []),
     {_, Time1} = statistics(wall_clock),
-    io:format("filter files use: ~w seconds ~n", [Time1 / 1000]),
 
+    length(Trans) > 0 andalso
+        begin
+            IsTransSuccess = compile_files(Trans, [{i, "include"}, {outdir, "ebin"}]),
+            IsTransSuccess =:= error andalso erlang:throw({error, "compile trans fail"})
+        end,
     length(Behaviors) > 0 andalso
         begin
             IsBehaviorsSuccess = compile_files(Behaviors),
             IsBehaviorsSuccess =:= error andalso erlang:throw({error, "compile bahavior fail"})
         end,
     DivideFiles = divide_list(RestFiles, ?PROCESS_TASK_NUM),
-    %% length(HrlChangeList) > 0 andalso io:format("change hrl files ~p ~n", [HrlChangeList]),
-    %% io:format("need compile files ~p ~n", [NeedCompileFiles]),
+
     IDList = init_worker(MaxProcess, self(), []),
     [Pid ! start || Pid <- IDList],
     IsSuccessful = manager(DivideFiles, IDList),
@@ -111,12 +120,15 @@ hot_update(MaxProcess) ->
             InsertHrl = get_files_curr_ver(sets:to_list(ChangeSet), []),
             insert_list(DetsUpdateValues ++ InsertHrl),
             {_, Time2} = statistics(wall_clock),
+
+            io:format("filter files use: ~w seconds ~n", [Time1 / 1000]),
+            HrlL = length(HrlChangeList),
+            HrlL > 0 andalso io:format("~w header files have been changed ~n", [HrlL]),
             io:format("hot update ~w modules in: ~w seconds~n", [length(NeedCompileFiles), Time2 / 1000]),
             ok;
         fail ->
             throw({error, "Hot compile fail"})
     end.
-
 
 %% @doc 编译所有并存版本库
 -spec compile_all(MaxProcess) -> ok|{error, Reason} when
@@ -125,12 +137,15 @@ hot_update(MaxProcess) ->
 
 compile_all(MaxProcess) ->
     FileList = get_src_files(),
-    {Behaviors, RestFiles} = filter_behaviors(FileList, [], []),
+    {Trans, Behaviors, RestFiles} = filter_behaviors(FileList, [], [], []),
     statistics(wall_clock),
+    compile_first(),
+    io:format("Trans ~p ~n", [Trans]),
+    IsTransSuccess = compile_files(Trans, [{i, "include"}, {outdir, "ebin"}]),
+    IsTransSuccess =:= error andalso erlang:throw({error, "compile trans fail"}),
     IsBehaviorsSuccess = compile_files(Behaviors),
     IsBehaviorsSuccess =:= error andalso erlang:throw({error, "compile bahavior fail"}),
     DiviedFles = divide_list(RestFiles, ?PROCESS_TASK_NUM),
-    io:format("compiled behaviors: ~p~n", [Behaviors]),
     IDList = init_worker(MaxProcess, self(), []),
     [Pid ! start || Pid <- IDList],
     IsSuccessful = manager(DiviedFles, IDList),
@@ -140,14 +155,15 @@ compile_all(MaxProcess) ->
             HrlFiles = get_include_files(),
             InsertFiles = get_files_curr_ver(FileList ++ HrlFiles, []),
             insert_list(InsertFiles),
-            copy_file(?APP_FILE_PATH, ?APP_NAME),
             Sum = length(FileList),
             io:format("compiled ~p modules with ~p processes in ~p s~n", [Sum, MaxProcess, TotalTime / 1000]),
+            io:format("compiled ~p behavior modules ~n", [length(Behaviors)]),
             io:format("compiled sum is ~w ~n", [Sum]),
             ok;
         fail ->
             throw({error, "compile fail~n"})
     end.
+
 
 
 %% @doc 分发进程
@@ -427,7 +443,8 @@ filter_for_hot_update_1([H | T], ChangeHrlList, NeedCompileFiles, DetsUpdateErlF
 
 %% @doc 批量编译
 compile_files(List) ->
-    EMakeArgs = ?EMAKEFILE_ARGS,
+    compile_files(List, ?EMAKEFILE_ARGS).
+compile_files(List, EMakeArgs) ->
     {_, OutDir} = lists:keyfind(outdir, 1, EMakeArgs),
     lists:foreach(
         fun(Name) ->
@@ -443,18 +460,24 @@ compile_files(List) ->
     ),
     make:files(List, EMakeArgs).
 
-%% @doc 过滤出行为树文件
-filter_behaviors([], Behaviors, RestFiles) ->
-    {Behaviors, RestFiles};
-filter_behaviors([?MODULE_PATH | T], Behaviors, RestFiles) ->
-    filter_behaviors(T, Behaviors, [?MODULE_PATH | RestFiles]);
-filter_behaviors([H | T], Behaviors, RestFiles) ->
+%%% @doc 过滤出行为树文件
+filter_behaviors([], Trans, Behaviors, RestFiles) ->
+    {Trans, Behaviors, RestFiles};
+filter_behaviors([?MODULE_PATH | T], Trans, Behaviors, RestFiles) ->
+    filter_behaviors(T, Trans, Behaviors, [?MODULE_PATH | RestFiles]);
+filter_behaviors([H | T], Trans, Behaviors, RestFiles) ->
     {ok, Bin} = file:read_file(H),
     case re:run(Bin, ?MP(?PATTERN_BEHAVIOR), [{capture, none}]) of
-        match -> filter_behaviors(T, [H | Behaviors], RestFiles);
-        _ -> filter_behaviors(T, Behaviors, [H | RestFiles])
+        match ->
+            filter_behaviors(T, Trans, [H | Behaviors], RestFiles);
+        _ ->
+            case re:run(Bin, ?MP(?PATTERN_TRANS), [{capture, none}]) of
+                match ->
+                    filter_behaviors(T, [H | Trans], Behaviors, RestFiles);
+                _ ->
+                    filter_behaviors(T, Trans, Behaviors, [H | RestFiles])
+            end
     end.
-
 %% @doc 打开dets表，不存在则初始化表
 open() ->
     case dets:open_file(?TABLE, ?OPEN_ARGS) of
@@ -465,3 +488,12 @@ open() ->
 %% @doc 使用后关闭表
 close() ->
     dets:close(?TABLE).
+
+%% @doc 全编译先编译
+%%  根据参数选出最高优先级进行编译 已解决
+%% todo trans 依赖 trans
+compile_first() ->
+    CompileFirstL = ?TRANS_SEQ_FILES,
+    Opts = [{i, "include"}, {outdir, "ebin"}],
+    compile_files(CompileFirstL, Opts),
+    ok.
