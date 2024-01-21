@@ -33,6 +33,7 @@
 -define(EMAKEFILE, "./Emakefile").
 -define(PATTERN_HRL, "\"(\\S+.hrl)\"").
 -define(PATTERN_BEHAVIOR, "-callback").
+-define(PATTERN_TRANS, "parse_transform[(].*,.*[)].*->").
 -define(MP(Pattern), element(2, re:compile(Pattern))).
 -define(MD5(Bin), erlang:md5(Bin)).
 
